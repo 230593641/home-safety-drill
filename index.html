@@ -345,9 +345,22 @@
       <input type="password" id="cfgAsrToken" placeholder="火山引擎控制台里该应用对应的 Access Token">
     </div>
     <div class="fld">
-      <label>Cluster（集群，一般不用改）</label>
+      <label>Resource ID（资源ID，必须与控制台开通的一致）</label>
+      <input type="text" id="cfgAsrResource" list="asrResourceList" placeholder="volc.seedasr.sauc.duration">
+      <datalist id="asrResourceList">
+        <option value="volc.seedasr.sauc.duration">豆包流式识别 2.0 · 小时版</option>
+        <option value="volc.seedasr.sauc.concurrent">豆包流式识别 2.0 · 并发版</option>
+        <option value="volc.bigasr.sauc.duration">豆包流式识别 1.0 · 小时版</option>
+        <option value="volc.bigasr.sauc.concurrent">豆包流式识别 1.0 · 并发版</option>
+      </datalist>
+      <div class="tip">填错是最常见的「错误码 198 / no available instances」原因。
+        识别走本地服务转发（浏览器无法设置 v3 需要的请求头），
+        所以必须用「启动网页.bat」启动后用 http://127.0.0.1:8000/ 打开。</div>
+    </div>
+    <div class="fld">
+      <label>Cluster（仅旧版 v2 接口用，一般不用改）</label>
       <input type="text" id="cfgAsrCluster" placeholder="volc_auc_common">
-      <div class="tip">语音识别走火山引擎 WebSocket 直连（wss://openspeech.bytedance.com），不依赖谷歌，国内可用。</div>
+      <div class="tip" id="asrChannelTip">识别通道检测中…</div>
     </div>
     <div class="fld">
       <label>语音服务地址（Edge TTS）</label>
@@ -387,8 +400,9 @@ const CONFIG = {
   ENDPOINT: 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
   ASR_APPID: '',                     // ← 火山引擎语音识别 AppID
   ASR_TOKEN: '',                     // ← 火山引擎语音识别 Access Token
-  ASR_CLUSTER: 'volc_auc_common',    // ← 语音识别集群（控制台显示的 Cluster ID，一般不用改）
-  ASR_URL: 'wss://openspeech.bytedance.com/api/v2/asr',
+  ASR_RESOURCE_ID: 'volc.seedasr.sauc.duration',  // ← 资源ID（必须与控制台开通的版本一致）
+  ASR_CLUSTER: 'volc_auc_common',    // ← 旧版 v2 接口的集群，一般不用改
+  ASR_URL: 'wss://openspeech.bytedance.com/api/v2/asr',   // 旧版直连地址（v3 走本地代理）
   TEMPERATURE: 0.9,
   MAX_TOKENS: 120,
   KNOCK_SRC: 'audio/bgm.mp3',        // 敲门音效：相对路径，跟 HTML 放在一起
@@ -1088,14 +1102,376 @@ const ASR_ERR = {
   1020: '识别等待超时（1020）',
   1021: '识别处理超时（1021）',
   1022: '识别错误（1022）',
-  1099: '未知错误（1099）'
+  1099: '未知错误（1099）',
+  198: '没有可用实例（198）：你开通的多半是 v3 大模型流式识别，'
+     + '而 v2 老旧接口找不到它的实例。请用「启动网页.bat」启动、'
+     + '以 http://127.0.0.1:8000/ 打开本页（走本地代理的 v3 通道）'
 };
 
 function asrConfigReady(){
   return !!(CONFIG.ASR_APPID.trim() && CONFIG.ASR_TOKEN.trim());
 }
 
+/* -------------------------------------------------------------------------
+   v3 大模型流式识别（当前控制台开通的「豆包流式语音识别」走这套）
+   注意：v3 用 X-Api-* 请求头鉴权，浏览器 WebSocket 不能设请求头，
+   所以必须经本地服务（tts_server.py 的 /asr）代理转发。
+   ------------------------------------------------------------------------- */
+const ASR_V3_ERR = {
+  20000000: '成功',
+  45000001: '请求参数无效（45000001）',
+  45000002: '空音频（45000002）',
+  45000081: '等待音频包超时（45000081）',
+  45000151: '音频格式不正确（45000151）',
+  45000000: '没有可用实例（45000000）',
+  55000031: '服务器繁忙（55000031）'
+};
+
+let asrProxyBase = '';      // 本地代理地址，如 http://127.0.0.1:8000
+let asrProxyReady = false;
+
+/* 探测本地代理是否可用（有它才能用 v3） */
+async function detectASRProxy(){
+  const cands = [];
+  const custom = (localStorage.getItem('fangguai_tts') || '').replace(/\/+$/, '');
+  if(custom) cands.push(custom);
+  if(/^https?:/.test(location.protocol)) cands.push(location.origin);
+  cands.push('http://127.0.0.1:8000');
+  asrProxyReady = false;
+  asrProxyBase = '';
+  for(const c of cands){
+    try{
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 1200);
+      const r = await fetch(c + '/asr-health', { cache: 'no-store', signal: ctrl.signal });
+      clearTimeout(t);
+      if(r.ok){
+        const j = await r.json();
+        if(j && j.proxy){ asrProxyReady = true; asrProxyBase = c; return true; }
+      }
+    }catch(e){ /* 试下一个 */ }
+  }
+  return false;
+}
+
+/* gzip：v3 官方示例全链路 gzip；浏览器不支持时退回不压缩（header 里声明） */
+async function gzBytes(u8){
+  if(typeof CompressionStream === 'undefined') return null;
+  try{
+    const cs = new CompressionStream('gzip');
+    const w = cs.writable.getWriter();
+    w.write(u8); w.close();
+    const ab = await new Response(cs.readable).arrayBuffer();
+    return new Uint8Array(ab);
+  }catch(e){ return null; }
+}
+async function gunzipBytes(u8){
+  if(typeof DecompressionStream === 'undefined') return u8;
+  try{
+    const ds = new DecompressionStream('gzip');
+    const w = ds.writable.getWriter();
+    w.write(u8); w.close();
+    const ab = await new Response(ds.readable).arrayBuffer();
+    return new Uint8Array(ab);
+  }catch(e){ return u8; }
+}
+
+/* 统一入口：优先 v3（经本地代理），没有代理就退回 v2 直连 */
 function startListening(){
+  if(ended) return;
+
+  if(!ENV.secure){
+    showAlert(ENV.file
+      ? '本地文件（file://）不能用麦克风，请用 http://127.0.0.1:8000/ 打开本页'
+      : '当前不是 https / localhost，浏览器会禁用麦克风，请改用 http://127.0.0.1:8000/', 'error');
+    return;
+  }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showAlert('浏览器没有麦克风接口（navigator.mediaDevices 不存在），请改用 Chrome / Edge', 'error');
+    return;
+  }
+  if(!asrConfigReady()){
+    showAlert('还没配置火山引擎语音识别：点右上角「设置」，填入 AppID 和 Access Token', 'error');
+    return;
+  }
+  if(appState !== AppState.LISTENING && appState !== AppState.IDLE){
+    showAlert('对方还在说话，稍等一下（或点「重置对话」强制解锁）', 'info');
+    return;
+  }
+  // 同一时刻只允许一个识别会话，避免并发占满实例
+  if(recog){ try{ recog.stop(); }catch(e){} recog = null; }
+
+  stopAudio();
+  // 有本地代理 → 走 v3（大模型流式，控制台新开通的服务都在这套上）
+  // 没代理 → 退回旧版 v2 直连（不需要请求头，但只有老服务能用）
+  if(asrProxyReady) startV3Session();
+  else startListeningV2();
+}
+
+function startV3Session(){
+  const S = {
+    ws: null, ctx: null, stream: null, src: null, proc: null, gain: null,
+    opened: false, finalized: false, attempt: 0, text: '', connId: '',
+    sendQ: Promise.resolve(), lastRespAt: 0, recvTimer: null, maxTimer: null
+  };
+  recog = S;
+
+  const useGzip = (typeof CompressionStream !== 'undefined');
+  const compBit = useGzip ? 0x01 : 0x00;
+
+  S.writeFrame = (b0, b1, payload) => {
+    if(!S.ws || S.ws.readyState !== 1) return;
+    const len = payload.length;
+    const buf = new Uint8Array(8 + len);
+    buf[0] = b0; buf[1] = b1; buf[2] = compBit; buf[3] = 0x00;
+    buf[4] = (len >>> 24) & 0xff; buf[5] = (len >>> 16) & 0xff;
+    buf[6] = (len >>> 8) & 0xff;  buf[7] = len & 0xff;
+    buf.set(payload, 8);
+    S.ws.send(buf);
+  };
+
+  const enqueue = fn => { S.sendQ = S.sendQ.then(fn).catch(() => {}); };
+
+  S.sendFullClient = () => enqueue(async () => {
+    const req = {
+      user: { uid: 'wb_' + (Date.now() % 1e12) },
+      audio: { format: 'pcm', codec: 'raw', rate: 16000, bits: 16, channel: 1 },
+      request: {
+        model_name: 'bigmodel',
+        enable_itn: true,
+        enable_punc: true,
+        enable_ddc: false,
+        show_utterances: true,
+        end_window_size: 800
+      }
+    };
+    let body = new TextEncoder().encode(JSON.stringify(req));
+    if(useGzip){ const g = await gzBytes(body); if(g) body = g; }
+    // 0x11: ver1+header4 | 0x10: full client, flags=0 | payload
+    S.writeFrame(0x11, 0x10, body);
+  });
+
+  S.sendAudio = async pcm => {
+    if(!S.ws || S.ws.readyState !== 1 || !S.opened || S.finalized) return;
+    if(S.ws.bufferedAmount > 1 << 20) return;          // 积压就丢帧，别拖垮连接
+    let body = new Uint8Array(pcm.buffer);
+    if(useGzip){ const g = await gzBytes(body); if(g) body = g; }
+    S.writeFrame(0x11, 0x20, body);
+  };
+
+  S.sendLast = () => enqueue(async () => {
+    // 0x22: audio only + flags=last（负包），空 body
+    S.writeFrame(0x11, 0x22, new Uint8Array(0));
+  });
+
+  S.stopCapture = () => {
+    try{ if(S.proc){ S.proc.disconnect(); S.proc.onaudioprocess = null; } }catch(e){}
+    try{ if(S.src) S.src.disconnect(); }catch(e){}
+    try{ if(S.gain) S.gain.disconnect(); }catch(e){}
+    try{ if(S.stream) S.stream.getTracks().forEach(t => t.stop()); }catch(e){}
+    try{ if(S.ctx && S.ctx.state !== 'closed') S.ctx.close(); }catch(e){}
+  };
+
+  S.closeWs = () => {
+    if(!S.ws) return;
+    try{ S.ws.onopen = S.ws.onmessage = S.ws.onerror = S.ws.onclose = null; }catch(e){}
+    try{ if(S.ws.readyState === 0 || S.ws.readyState === 1) S.ws.close(1000); }catch(e){}
+    S.ws = null;
+  };
+
+  S.teardown = () => {
+    clearTimeout(S.maxTimer); clearTimeout(S.recvTimer);
+    S.stopCapture();
+    S.closeWs();            // ★ 及时释放实例，杜绝僵尸连接
+  };
+
+  S.fail = msg => {
+    if(S.finalized) return;
+    S.finalized = true;
+    S.teardown();
+    recog = null; recogActive = false;
+    setState(AppState.LISTENING);
+    statusLine.textContent = msg;
+    showAlert(msg, 'error', true);
+  };
+
+  S.finalize = text => {
+    if(S.finalized) return;
+    S.finalized = true;
+    S.teardown();
+    recog = null; recogActive = false;
+    const t = (text || S.text || '').trim();
+    if(t) handleUserInput(t);
+    else { setState(AppState.LISTENING); statusLine.textContent = '没识别到内容，再点一次麦克风试试'; }
+  };
+
+  S.stop = () => {
+    if(S.finalized) return;
+    S.stopCapture();
+    S.sendLast();
+    clearTimeout(S.recvTimer);
+    S.recvTimer = setTimeout(() => S.finalize(S.text), 3000);
+  };
+
+  /* 198 / 45000000 = 没有可用实例 → 等 1.5s 自动重试，最多 2 次 */
+  const isNoInstance = (code, msg) =>
+    code === 198 || code === 45000000 || /no available instances/i.test(msg || '');
+
+  S.handleErr = (code, msg) => {
+    if(S.finalized) return;
+    if(isNoInstance(code, msg) && S.attempt < 2){
+      S.attempt++;
+      statusLine.innerHTML = '识别服务暂时没实例，正在重试（第 ' + S.attempt + ' 次）…';
+      S.closeWs();
+      setTimeout(() => { if(!S.finalized) connect(); }, 1500);
+      return;
+    }
+    let hint = '';
+    if(isNoInstance(code, msg)){
+      hint = '没有可用实例。请依次确认：'
+        + '①控制台已开通「流式语音识别」且未到期；'
+        + '②Resource ID 与控制台开通的版本一致（2.0 小时版 volc.seedasr.sauc.duration，1.0 小时版 volc.bigasr.sauc.duration，并发版把 duration 换成 concurrent）；'
+        + '③并发额度没被占满。当前用的是 ' + CONFIG.ASR_RESOURCE_ID;
+    } else {
+      hint = ASR_V3_ERR[code] || ('错误码 ' + code);
+    }
+    S.fail('火山引擎语音识别：' + hint + (msg ? '（' + msg + '）' : ''));
+  };
+
+  S.parse = async ev => {
+    let bytes;
+    if(ev.data instanceof ArrayBuffer) bytes = new Uint8Array(ev.data);
+    else if(ev.data && ev.data.byteLength !== undefined) bytes = new Uint8Array(ev.data);
+    else return;
+    if(bytes.length < 4) return;
+
+    const msgType = (bytes[1] >> 4) & 0x0f;
+    const flags = bytes[1] & 0x0f;
+    const comp = bytes[2] & 0x0f;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    if(msgType === 0x0f){                     // error frame
+      const code = dv.getUint32(4);
+      const sz = dv.getUint32(8);
+      const msg = new TextDecoder().decode(bytes.slice(12, 12 + sz));
+      S.handleErr(code, msg);
+      return;
+    }
+    if(msgType !== 0x09) return;              // 只处理 full server response
+
+    let p = 4;
+    let seq = 0;
+    if(flags & 0x01){ seq = dv.getInt32(p); p += 4; }
+    const size = dv.getUint32(p); p += 4;
+    let payload = bytes.slice(p, p + size);
+    if(comp === 0x01) payload = await gunzipBytes(payload);
+
+    let json;
+    try{ json = JSON.parse(new TextDecoder('utf-8').decode(payload)); }
+    catch(e){ return; }
+
+    if(json.code && json.code !== 20000000 && json.code !== 0){
+      S.handleErr(json.code, json.message || '');
+      return;
+    }
+    const r = json.result;
+    const text = (r && r.text) ? String(r.text).trim() : '';
+    if(text){
+      S.text = text;
+      statusLine.innerHTML = '听到：<b>' + text + '</b>';
+    }
+    S.lastRespAt = Date.now();
+    if(seq < 0) S.finalize(text);              // 负序号 = 最终结果
+  };
+
+  S.onMsg = ev => { S.parse(ev).catch(() => {}); };
+
+  function connect(){
+    if(S.finalized) return;
+    const wsBase = (asrProxyBase || (localStorage.getItem('fangguai_tts') || 'http://127.0.0.1:8000'))
+      .replace(/^http/, 'ws').replace(/\/+$/, '');
+    const url = wsBase + '/asr?appid=' + encodeURIComponent(CONFIG.ASR_APPID.trim())
+      + '&token=' + encodeURIComponent(CONFIG.ASR_TOKEN.trim())
+      + '&resource_id=' + encodeURIComponent(CONFIG.ASR_RESOURCE_ID.trim());
+
+    let ws;
+    try{ ws = new WebSocket(url); }
+    catch(e){ S.fail('无法连接本地识别代理：' + (e && e.message ? e.message : e)); return; }
+    S.ws = ws;
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      S.opened = true;
+      recogActive = true;
+      setState(AppState.LISTENING);
+      statusLine.textContent = '正在听……说完会自动发送（再点一下麦克风也可结束）';
+      S.sendFullClient();
+    };
+    ws.onmessage = S.onMsg;
+    ws.onerror = () => {
+      if(S.finalized) return;
+      if(!S.opened){
+        asrProxyReady = false;
+        S.fail('连不上本地识别代理（' + wsBase + '/asr）。'
+          + 'v3 识别必须经本地服务转发请求头，请双击「启动网页.bat」后用 http://127.0.0.1:8000/ 打开本页');
+      }
+    };
+    ws.onclose = ev => {
+      if(S.finalized) return;
+      if(S.text){ S.finalize(S.text); return; }
+      if(S.opened){
+        S.fail('识别连接被关闭（code ' + (ev ? ev.code : '?') + '）。多为鉴权失败或 Resource ID 不匹配，请检查设置');
+      }
+    };
+  }
+
+  navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  }).then(stream => {
+    S.stream = stream;
+    try{
+      const AC = window.AudioContext || window.webkitAudioContext;
+      S.ctx = new AC({ sampleRate: 16000 });
+      S.src = S.ctx.createMediaStreamSource(stream);
+      S.proc = S.ctx.createScriptProcessor(2048, 1, 1);
+      S.gain = S.ctx.createGain();
+      S.gain.gain.value = 0;
+      S.src.connect(S.proc);
+      S.proc.connect(S.gain);
+      S.gain.connect(S.ctx.destination);
+      S.proc.onaudioprocess = e => {
+        if(!S.opened || S.finalized) return;
+        const ch = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(ch.length);
+        for(let i = 0; i < ch.length; i++){
+          const s = Math.max(-1, Math.min(1, ch[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        S.sendAudio(pcm);
+      };
+    }catch(e){
+      S.fail('麦克风音频初始化失败：' + (e && e.message ? e.message : e));
+      return;
+    }
+    connect();
+  }).catch(e => {
+    const name = (e && e.name) || '';
+    const map = {
+      NotAllowedError: '麦克风被拒绝：点地址栏右侧的麦克风图标，允许本页使用麦克风后刷新',
+      NotFoundError: '没有检测到麦克风设备，请检查耳机 / 麦克风是否接好',
+      SecurityError: '当前不是 https / localhost，浏览器禁用了麦克风，请用 http://127.0.0.1:8000/ 打开'
+    };
+    S.fail(map[name] || ('麦克风启动失败：' + (name || e)));
+  });
+
+  S.maxTimer = setTimeout(() => {
+    if(S.finalized) return;
+    if(!S.opened) S.fail('连接识别服务超时（15 秒），请确认本地服务在运行、网络能访问火山引擎');
+    else S.finalize(S.text);
+  }, 15000);
+}
+
+function startListeningV2(){
   if(ended) return;
 
   // ① 环境前置判断
@@ -1465,6 +1841,7 @@ $('setBtn').addEventListener('click', () => {
     + ' · 安全上下文' + (ENV.secure ? '✓' : '✗')
     + ' · 语音识别' + (ENV.stt ? '✓' : '✗')
     + (asrConfigReady() ? ' · 火山ASR已配置✓' : ' · 火山ASR未配置✗')
+    + (asrProxyReady ? ' · 识别通道 v3代理✓' : ' · 识别通道 v2直连')
     + ' · 麦克风接口' + (ENV.media ? '✓' : '✗')
     + ' · 浏览器' + (ENV.chrome ? 'Chrome' : '非 Chrome');
   $('cfgKey').value = CONFIG.API_KEY;
@@ -1472,7 +1849,11 @@ $('setBtn').addEventListener('click', () => {
   $('cfgUrl').value = CONFIG.ENDPOINT;
   $('cfgAsrAppid').value = CONFIG.ASR_APPID;
   $('cfgAsrToken').value = CONFIG.ASR_TOKEN;
+  $('cfgAsrResource').value = CONFIG.ASR_RESOURCE_ID;
   $('cfgAsrCluster').value = CONFIG.ASR_CLUSTER;
+  $('asrChannelTip').textContent = asrProxyReady
+    ? '✓ 本地识别代理已就绪（' + asrProxyBase + '/asr）：走 v3 大模型流式识别'
+    : '✗ 没检测到本地识别代理：v3 需要它转发请求头，请用「启动网页.bat」启动后用 http://127.0.0.1:8000/ 打开';
   $('cfgTts').value = localStorage.getItem('fangguai_tts') || '';
   $('cfgWeb').checked = CONFIG.WEBSPEECH_FALLBACK;
   $('setMask').classList.add('show');
@@ -1485,6 +1866,7 @@ $('cfgSave').addEventListener('click', async () => {
   CONFIG.ENDPOINT = $('cfgUrl').value.trim() || 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
   CONFIG.ASR_APPID = $('cfgAsrAppid').value.trim();
   CONFIG.ASR_TOKEN = $('cfgAsrToken').value.trim();
+  CONFIG.ASR_RESOURCE_ID = $('cfgAsrResource').value.trim() || 'volc.seedasr.sauc.duration';
   CONFIG.ASR_CLUSTER = $('cfgAsrCluster').value.trim() || 'volc_auc_common';
   localStorage.setItem('fangguai_tts', $('cfgTts').value.trim());
   CONFIG.WEBSPEECH_FALLBACK = $('cfgWeb').checked;
@@ -1493,8 +1875,10 @@ $('cfgSave').addEventListener('click', async () => {
   localStorage.setItem('fangguai_model', CONFIG.MODEL_ID);
   localStorage.setItem('fangguai_asr_appid', CONFIG.ASR_APPID);
   localStorage.setItem('fangguai_asr_token', CONFIG.ASR_TOKEN);
+  localStorage.setItem('fangguai_asr_resource', CONFIG.ASR_RESOURCE_ID);
   localStorage.setItem('fangguai_asr_cluster', CONFIG.ASR_CLUSTER);
   $('setMask').classList.remove('show');
+  await detectASRProxy();
   await detectTTS();
   statusLine.innerHTML = apiReady() ? '已连接大模型，可以开始演练' : '当前用<b>本地话术</b>演练，可在设置里填 API Key';
 });
@@ -1531,15 +1915,18 @@ $('startBtn').addEventListener('click', startGame);
   if(savedWeb !== null) CONFIG.WEBSPEECH_FALLBACK = savedWeb === '1';
   const savedAppid = localStorage.getItem('fangguai_asr_appid');
   const savedToken = localStorage.getItem('fangguai_asr_token');
+  const savedRes = localStorage.getItem('fangguai_asr_resource');
   const savedCluster = localStorage.getItem('fangguai_asr_cluster');
   if(savedAppid) CONFIG.ASR_APPID = savedAppid;
   if(savedToken) CONFIG.ASR_TOKEN = savedToken;
+  if(savedRes) CONFIG.ASR_RESOURCE_ID = savedRes;
   if(savedCluster) CONFIG.ASR_CLUSTER = savedCluster;
 
   envCheck();                            // 环境自检：file:// / 非 https / 不支持识别，都会弹提示
   loadScene('wang', false);              // 先铺好界面，等用户点「点击开始」再敲门发声
 
   detectTTS();
+  detectASRProxy();                      // 探测本地识别代理（v3 需要它转发请求头）
 })();
 </script>
 </body>
