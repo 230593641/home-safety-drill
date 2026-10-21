@@ -321,10 +321,8 @@
 <!-- ============ 设置 ============ -->
 <div class="mask" id="setMask">
   <div class="modal">
-    <h3>接入大模型</h3>
-    <p class="sub">填入火山引擎方舟（豆包大模型）的 API Key 与推理接入点，即可启用 AI 动态对话。<br>
-    <b style="color:#c0392b">本次输入只在当前浏览器标签页内有效，关闭页面或刷新后自动清空，下次打开需要重新填写。</b><br>
-    点「跳过」则使用内置的本地话术，不联网也能演练。</p>
+    <h3>接口设置</h3>
+    <p class="sub">填入火山引擎方舟（豆包大模型）的 API Key 与推理接入点。留空则使用内置的本地话术，课堂演示不联网也能跑通。</p>
     <div class="fld">
       <label>API Key</label>
       <input type="password" id="cfgKey" placeholder="ark 平台生成的 API Key">
@@ -346,8 +344,8 @@
     </div>
     <label class="chk"><input type="checkbox" id="cfgWeb"> 没有语音服务时，用浏览器内置语音兜底（音质一般）</label>
     <div class="acts">
-      <button class="b-ghost" id="cfgCancel" type="button">跳过</button>
-      <button class="b-dark" id="cfgSave" type="button">连接大模型</button>
+      <button class="b-ghost" id="cfgCancel" type="button">取消</button>
+      <button class="b-dark" id="cfgSave" type="button">保存</button>
     </div>
   </div>
 </div>
@@ -555,7 +553,7 @@ let audioUnlocked = false;
 function unlockAudio(){
   if(audioUnlocked) return;
   audioUnlocked = true;
-  // ① 激活 AudioContext
+  // ① 激活 AudioContext（必须在用户手势里 resume）
   try{
     const AC = window.AudioContext || window.webkitAudioContext;
     if(AC){
@@ -569,14 +567,17 @@ function unlockAudio(){
       window.__audioCtx = ctx;
     }
   }catch(e){ console.warn('[AudioContext 解锁失败]', e); }
-  // ② 用极短静音解锁 <audio> 元素
+  // ② 关键：必须在用户手势里「非静音」地 play 一次，浏览器才会授予后续
+  //    onended 自动播放下一段的权限。内容是 1 采样的静音 WAV，听不见。
+  //    ★ 注意：绝不能 muted=true——Chrome 规定静音播放不授予出声权限。
+  //    这里 muted=false、内容本身静音；不 pause、不打断，让它自然结束，
+  //    避免和紧跟着的敲门声产生 AbortError 竞态。
   try{
-    const keepMuted = currentAudio.muted;
-    currentAudio.muted = true;
+    currentAudio.muted = false;
+    currentAudio.volume = 1;
     currentAudio.src = SILENT_WAV;
     const p = currentAudio.play();
-    if(p && p.then) p.then(() => { currentAudio.pause(); currentAudio.muted = keepMuted; })
-                     .catch(() => { currentAudio.muted = keepMuted; });
+    if(p && p.catch) p.catch(() => {});
   }catch(e){ console.warn('[静音解锁失败]', e); }
 }
 
@@ -688,6 +689,8 @@ function playAudio(src, maxMs, cb, quiet){
   };
 
   try{
+    currentAudio.muted = false;      // ★ 兜底：绝不让真实内容处于静音态播放
+    currentAudio.volume = 1;
     currentAudio.src = src;
     const p = currentAudio.play();
     if(p && p.catch) p.catch(e => {
@@ -1284,10 +1287,7 @@ $('setBtn').addEventListener('click', () => {
   $('cfgWeb').checked = CONFIG.WEBSPEECH_FALLBACK;
   $('setMask').classList.add('show');
 });
-$('cfgCancel').addEventListener('click', () => {
-  $('setMask').classList.remove('show');
-  statusLine.innerHTML = '已跳过：当前用<b>本地话术</b>演练。需要大模型时点右上角「设置」现填 Key。';
-});
+$('cfgCancel').addEventListener('click', () => $('setMask').classList.remove('show'));
 $('setMask').addEventListener('click', e => { if(e.target === $('setMask')) $('setMask').classList.remove('show'); });
 $('cfgSave').addEventListener('click', async () => {
   CONFIG.API_KEY = $('cfgKey').value.trim();
@@ -1296,10 +1296,11 @@ $('cfgSave').addEventListener('click', async () => {
   localStorage.setItem('fangguai_tts', $('cfgTts').value.trim());
   CONFIG.WEBSPEECH_FALLBACK = $('cfgWeb').checked;
   localStorage.setItem('fangguai_web', CONFIG.WEBSPEECH_FALLBACK ? '1' : '0');
-  // ★ API Key 与 Model ID 不写入 localStorage，只存在内存里，关页面即清空
+  localStorage.setItem('fangguai_key', CONFIG.API_KEY);
+  localStorage.setItem('fangguai_model', CONFIG.MODEL_ID);
   $('setMask').classList.remove('show');
   await detectTTS();
-  statusLine.innerHTML = apiReady() ? '已连接大模型，可以开始演练' : '当前用<b>本地话术</b>演练，点右上角设置可填 API Key';
+  statusLine.innerHTML = apiReady() ? '已连接大模型，可以开始演练' : '当前用<b>本地话术</b>演练，可在设置里填 API Key';
 });
 
 /* =========================================================================
@@ -1326,9 +1327,10 @@ $('startBtn').addEventListener('click', startGame);
   fitStage();
   currentAudio = $('ttsAudio');          // ★ 全局唯一播放器
 
-  // ★ API Key 不持久化：每次打开都清空，由用户现填，关闭页面即失效
-  CONFIG.API_KEY = '';
-  CONFIG.MODEL_ID = '';
+  const savedKey = localStorage.getItem('fangguai_key');
+  const savedModel = localStorage.getItem('fangguai_model');
+  if(savedKey) CONFIG.API_KEY = savedKey;
+  if(savedModel) CONFIG.MODEL_ID = savedModel;
   const savedWeb = localStorage.getItem('fangguai_web');
   if(savedWeb !== null) CONFIG.WEBSPEECH_FALLBACK = savedWeb === '1';
 
@@ -1336,13 +1338,6 @@ $('startBtn').addEventListener('click', startGame);
   loadScene('wang', false);              // 先铺好界面，等用户点「点击开始」再敲门发声
 
   detectTTS();
-
-  // ★ 启动后自动弹出「接入大模型」窗，让用户现填 Key；点跳过则走本地话术
-  setTimeout(() => {
-    $('cfgKey').value = '';
-    $('cfgModel').value = '';
-    $('setMask').classList.add('show');
-  }, 300);
 })();
 </script>
 </body>
