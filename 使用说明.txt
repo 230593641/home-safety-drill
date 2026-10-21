@@ -50,19 +50,21 @@
       ❌ 错误：双击 index.html（没有代理，识别用不了，只能打字）
     直接上传到 GitHub Pages 的话同理——只能听声音、打字回答，没有麦克风识别。
 
-  【第 2 点：Resource ID 必须和控制台开通的一致】
+  【第 2 点：填 API Key（不是 AppID/Token）】
+    识别接口是 v3 大模型流式识别，鉴权只认新版控制台的 X-Api-Key。
     1. 打开 https://console.volcengine.com 登录火山引擎；
     2. 找到「语音技术」，创建应用并开通「流式语音识别」；
-    3. 记下【AppID】【Access Token】和【Resource ID / 服务版本】；
-    4. 打开网页 → 右上角「设置」，填 AppID、Access Token，并在
-       Resource ID 下拉里选对应的那个：
-         volc.seedasr.sauc.duration    豆包流式识别 2.0 · 小时版（最常见）
-         volc.seedasr.sauc.concurrent  豆包流式识别 2.0 · 并发版
-         volc.bigasr.sauc.duration     豆包流式识别 1.0 · 小时版
-         volc.bigasr.sauc.concurrent   豆包流式识别 1.0 · 并发版
-       点「保存」，设置面板底部会显示「本地识别代理已就绪」即正常。
-    填错版本就是「错误码 198 / no available instances」最常见的原因。
-    程序遇到 198 会自动重试 2 次；仍失败会直接把排查要点显示在页面上。
+    3. 复制控制台里的【API Key】；
+    4. 网页 → 右上角「设置」：
+         · API Key         ← 填这里（必填）
+         · AppID / Access Token ← 留空（这是旧版控制台的，v3 不认）
+         · Resource ID     ← 选 volc.seedasr.sauc.duration（豆包流式识别 2.0 小时版）
+         · 接口模式        ← bigmodel（默认）
+       点「保存」，面板上会显示「✓ 本地识别代理已就绪」。
+    实测：如果填旧版 AppID+Token，服务端会回
+      「resourceId volc.seedasr.sauc.duration is not allowed」，
+      页面也会直接把这句话显示出来，不会再只说“没有可用实例”。
+    遇到 198 会自动重试 2 次；仍失败会列出排查要点。
 
 四、希沃白板 / 教室电脑上用
   方法一（推荐，麦克风也能用）：
@@ -89,17 +91,17 @@
   A: 说明你是双击 index.html 打开的。识别必须经本地服务转发请求头，
      请双击「启动网页.bat」，用 http://127.0.0.1:8000/ 打开页面。
   Q: 提示「错误码 198 / no available instances」？
-  A: Resource ID 和控制台开通的服务版本不一致，或服务到期、并发占满。
-     到「设置」里把 Resource ID 改成控制台显示的那个（见上文第三部分），
-     并确认服务状态是「已开通 / 运行中」。程序已内置 2 次自动重试。
+  A: 多半是鉴权方式或 Resource ID 不对。①确认填的是新版控制台的 API Key
+     （不是旧版 AppID+Token，v3 会回 "resourceId ... is not allowed"）；
+     ②Resource ID 用 volc.seedasr.sauc.duration；③确认服务状态是「已开通/运行中」。
+     程序已内置 2 次自动重试，仍失败会把服务端原话显示在页面上。
+  Q: 提示「鉴权失败：API Key 无效或已过期（401）」？
+  A: API Key 复制错了或已失效。到控制台重新复制，注意不要带空格。
   Q: 麦克风点了没反应？
   A: 1) 必须用 http://127.0.0.1:8000/ 或 https 打开（双击 html 文件时
         浏览器不允许用麦克风）；
      2) 地址栏右侧的麦克风图标，选「允许」；
-     3) 确认已在「设置」里填好火山引擎的 AppID 和 Access Token。
-  Q: 提示「鉴权失败 / 401 / 403」？
-  A: AppID 或 Access Token 填错了（Token 不要带空格、不要带 Bearer 前缀），
-     到控制台重新复制一份。
+     3) 确认「设置」里已填 API Key。
   Q: 没有大模型 API Key 能玩吗？
   A: 能。不填 Key 时用内置话术演练，流程完整；填了火山引擎方舟的
      Key 后，回答才由大模型实时生成（点页面上的「设置」填）。
